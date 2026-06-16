@@ -10,6 +10,8 @@ interface UploadZoneProps {
 export default function UploadZone({ onUpload, isLoading, error }: UploadZoneProps) {
   const [file, setFile] = useState<File | null>(null);
   const [password, setPassword] = useState('');
+  const [clearingCache, setClearingCache] = useState(false);
+  const [cacheMessage, setCacheMessage] = useState('');
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
@@ -21,6 +23,22 @@ export default function UploadZone({ onUpload, isLoading, error }: UploadZonePro
     e.preventDefault();
     if (file && password) {
       onUpload(file, password);
+    }
+  };
+
+  const handleClearCache = async () => {
+    setClearingCache(true);
+    try {
+      const response = await fetch('http://localhost:8000/api/clear-cache', { method: 'POST' });
+      if (response.ok) {
+        setCacheMessage('Cache cleared! Upload will fetch fresh NAVs.');
+        setTimeout(() => setCacheMessage(''), 4000);
+      }
+    } catch (err) {
+      setCacheMessage('Failed to clear cache.');
+      setTimeout(() => setCacheMessage(''), 4000);
+    } finally {
+      setClearingCache(false);
     }
   };
 
@@ -94,9 +112,20 @@ export default function UploadZone({ onUpload, isLoading, error }: UploadZonePro
           </button>
         </form>
 
-        <div className="mt-6 flex items-center justify-center gap-2 text-sm text-gray-500">
-          <ShieldCheck className="w-4 h-4" />
-          <span>Your PDF is processed locally and discarded. Only fund identifiers and NAVs are cached.</span>
+        <div className="mt-6 flex flex-col items-center justify-center gap-2 text-sm text-gray-500">
+          <div className="flex items-center gap-2">
+            <ShieldCheck className="w-4 h-4" />
+            <span>Your PDF is processed locally and discarded. Only fund identifiers and NAVs are cached.</span>
+          </div>
+          <button 
+            type="button" 
+            onClick={handleClearCache}
+            disabled={clearingCache}
+            className="text-vine-indigo hover:text-white transition-colors mt-2 underline decoration-vine-indigo/30 underline-offset-4"
+          >
+            {clearingCache ? 'Clearing...' : 'Force Refresh AMFI NAV Data (Clear Cache)'}
+          </button>
+          {cacheMessage && <span className="text-vine-mint font-medium animate-pulse">{cacheMessage}</span>}
         </div>
       </div>
     </div>

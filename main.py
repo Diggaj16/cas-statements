@@ -204,6 +204,11 @@ def process_cas_and_valuation(cas_tmp_path, cas_password, manual_mapping=None):
     return (transactions_df, holdings_df, total_value, latest_val_date, 
             live_total_value, live_date, data_warnings, unresolved_funds, scheme_amfi_map, valid_amfis)
 
+@app.post("/api/clear-cache")
+async def clear_cache():
+    nav_cache.clear()
+    return {"message": "Cache cleared successfully"}
+
 @app.post("/api/analyze")
 async def analyze_cas(
     cas_file: UploadFile = File(...),

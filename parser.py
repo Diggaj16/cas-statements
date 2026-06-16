@@ -140,8 +140,6 @@ def get_current_valuation(parsed_data):
                 if dt is not None:
                     if latest_date is None or dt > latest_date:
                         latest_date = dt
-                except:
-                    pass
                     
             units = safe_float(scheme.get('close', scheme.get('close_calculated', 0.0)))
             if units == 0.0 and value > 0 and safe_float(valuation.get('nav', 0.0)) > 0:

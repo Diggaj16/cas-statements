@@ -108,7 +108,7 @@ def extract_transactions(parsed_data, manual_map=None):
                 })
     df = pd.DataFrame(transactions)
     if not df.empty:
-        df['Date'] = pd.to_datetime(df['Date'], format='mixed', dayfirst=True)
+        df['Date'] = pd.to_datetime(df['Date'], format='mixed')
     return df
 
 def get_current_valuation(parsed_data):
@@ -133,7 +133,7 @@ def get_current_valuation(parsed_data):
                 try:
                     dt = pd.to_datetime(val_date).date()
                 except ValueError:
-                    dt = pd.to_datetime([val_date], format='mixed', dayfirst=True)[0].date()
+                    dt = pd.to_datetime([val_date], format='mixed')[0].date()
                 except:
                     dt = None
                 

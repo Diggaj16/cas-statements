@@ -1,0 +1,20 @@
+{
+  "liveXirr": 4.612637015441715,
+  "casXirr": 3.261592369072302,
+  "exclTax.liveXirr": 4.620743340423307,
+  "exclTax.casXirr": 3.270895400722593,
+  "fundWise": [
+    {
+      "Scheme": "JioBlackRock Flexi Cap Fund - Direct - Growth",
+      "LiveXIRR": -5.798500658927763
+    },
+    {
+      "Scheme": "Motilal Oswal BSE Enhanced Value Index Fund - Direct Growth",
+      "LiveXIRR": 10.396884705030482
+    },
+    {
+      "Scheme": "Parag Parikh Flexi Cap Fund - Direct Plan Growth",
+      "LiveXIRR": -4.664128989550229
+    }
+  ]
+}

@@ -321,106 +321,7 @@ def calculate_capture_ratios(portfolio_returns, benchmark_returns):
     return up_capture, down_capture, df
 
 
-def calculate_xirr_legacy(transactions_df, current_valuation, valuation_date=None):
-    if transactions_df.empty:
-        return None
 
-    cf_df = transactions_df.copy()
-    # Mask for positive units (purchases)
-    mask_pos = cf_df['Units'] > 0
-
-    # Default is abs(Amount)
-    cf_df['CF'] = cf_df['Amount'].abs()
-    # If units > 0, it's an outflow (-)
-    cf_df.loc[mask_pos, 'CF'] = -cf_df.loc[mask_pos, 'Amount'].abs()
-
-    # Drop rows where Amount is 0 or NaN
-    cf_df = cf_df.dropna(subset=['Amount'])
-    cf_df = cf_df[cf_df['Amount'] != 0]
-
-    # Group by Date
-    cf_df['Date'] = cf_df['Date'].dt.date
-    grouped_cf = cf_df.groupby('Date')['CF'].sum().reset_index()
-    grouped_cf.columns = ['Date', 'Amount']
-
-    cash_flows = list(zip(grouped_cf['Date'], grouped_cf['Amount']))
-
-    if current_valuation > 0:
-        today = valuation_date if valuation_date else datetime.now().date()
-        cash_flows.append((today, current_valuation))
-
-    final_cf = pd.DataFrame(cash_flows, columns=['Date', 'Amount']).groupby('Date')['Amount'].sum().reset_index()
-
-    try:
-        return xirr(final_cf['Date'], final_cf['Amount'])
-    except Exception:
-        return None
-
-
-def xirr_from_scratch(dates, amounts, guess=0.1, max_iter=100, tol=1e-6):
-    """
-    Calculates the Extended Internal Rate of Return (XIRR) from scratch using
-    the Newton-Raphson method, finding the root of the NPV equation.
-    """
-    if len(dates) != len(amounts) or len(dates) < 2:
-        return None
-
-    d0 = dates[0]
-    years = [(d - d0).days / 365.0 for d in dates]
-
-    def npv(r):
-        return sum(c / ((1 + r) ** y) for c, y in zip(amounts, years))
-
-    def npv_derivative(r):
-        return sum(-y * c / ((1 + r) ** (y + 1)) for c, y in zip(amounts, years) if y > 0)
-
-    r = guess
-    for _ in range(max_iter):
-        try:
-            f_value = npv(r)
-            if abs(f_value) < tol:
-                return r
-            f_derivative = npv_derivative(r)
-            if f_derivative == 0:
-                return None
-            r_new = r - f_value / f_derivative
-
-            # XIRR realistically cannot be <= -100% (total loss is -100%)
-            # Adjust to prevent complex numbers in fractional powers
-            if r_new <= -1.0:
-                r_new = -0.999999
-
-            if abs(r_new - r) < tol:
-                return r_new
-            r = r_new
-        except Exception:
-            return None
-
-    return None
-
-
-def calculate_xirr_from_scratch(transactions_df, current_valuation, valuation_date=None, include_switches=True):
-    """
-    Wrapper to calculate XIRR using our custom from-scratch function.
-    """
-    cash_flows, cf_records = _build_cashflows(transactions_df, include_switches, with_records=True)
-
-    if current_valuation > 0:
-        today = valuation_date if valuation_date else datetime.now().date()
-        cash_flows.append((today, current_valuation))
-        cf_records.append({'Date': today, 'Amount': current_valuation,
-                           'Scheme': 'ALL (Current Valuation)', 'Type': 'VALUATION',
-                           'Description': 'Final Portfolio Valuation'})
-
-    cf_df = pd.DataFrame(cash_flows, columns=['Date', 'Amount'])
-    cf_records_df = pd.DataFrame(cf_records)
-    if cf_df.empty:
-        return None, cf_records_df
-    cf_df = cf_df.groupby('Date')['Amount'].sum().reset_index()
-    cf_df = cf_df.sort_values('Date')
-
-    ans = xirr_from_scratch(cf_df['Date'].tolist(), cf_df['Amount'].tolist())
-    return ans, cf_records_df
 
 
 def prepare_base_cashflows(transactions_df, include_switches=True):
@@ -458,3 +359,49 @@ def calculate_xirr_fast(base_cf_df, current_valuation, valuation_date):
         return xirr(final_df['Date'], final_df['Amount'])
     except Exception:
         return None
+
+
+def compute_daily_portfolio_value(transactions_df, navs_dict, date_range, scheme_amfi_map, holdings_df=None):
+    """Daily portfolio value = sum over schemes of (net cumulative units held that
+    day) × (NAV that day). Units cumsum includes EVERY unit-changing row
+    (purchase/reinvest/redemption/switch/opening balance) so the final day
+    reconciles to current holdings. Schemes with no NAV are skipped (caller flags)."""
+    daily_val = pd.Series(0.0, index=date_range)
+    skipped = []
+    
+    # Pre-compute final statement values for unmatched funds
+    stmt_values = {}
+    if holdings_df is not None and not holdings_df.empty:
+        for _, row in holdings_df.iterrows():
+            if row['Value'] > 0 and row['Units'] > 0:
+                stmt_values[row['Scheme']] = row['Value'] / row['Units']
+
+    for scheme, txns in transactions_df.groupby('Scheme'):
+        amfi = scheme_amfi_map.get(scheme)
+        nav = navs_dict.get(amfi) if amfi else None
+        
+        daily_units = (txns.groupby('Date')['Units'].sum()
+                          .reindex(date_range, fill_value=0.0).cumsum())
+                          
+        if nav is None or nav.empty:
+            skipped.append(scheme)
+            navs = pd.Series(np.nan, index=date_range)
+            
+            # 1. Fill known transaction NAVs
+            if 'NAV' in txns.columns:
+                known_navs = txns.dropna(subset=['NAV']).groupby('Date')['NAV'].last()
+                for d, val in known_navs.items():
+                    if d in navs.index:
+                        navs[d] = val
+            
+            # 2. Pin the final date NAV to the statement's implied NAV
+            if scheme in stmt_values:
+                navs.iloc[-1] = stmt_values[scheme]
+            
+            # 3. Interpolate the missing daily NAVs smoothly
+            navs = navs.interpolate(method='linear').ffill().bfill().fillna(0.0)
+        else:
+            navs = nav['nav'].reindex(date_range, method='ffill').bfill()
+            
+        daily_val += (daily_units * navs).fillna(0.0)
+    return daily_val, skipped

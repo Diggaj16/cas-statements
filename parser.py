@@ -1,7 +1,7 @@
 import casparser
 from io import BytesIO
 import pandas as pd
-from mf_api import normalize_amfi, resolve_amfi_from_isin
+from mf_api import resolve_scheme_code
 
 def parse_cas(file_obj, password):
     import json
@@ -29,23 +29,22 @@ def safe_float(val):
             return 0.0
     return 0.0
 
-def extract_transactions(parsed_data):
+def extract_transactions(parsed_data, manual_map=None):
     # Extract transactions into a flat pandas dataframe for easier processing
     transactions = []
     for folio in parsed_data.get('folios', []):
         pan = folio.get('PAN', 'Unknown PAN')
         if not pan or str(pan).strip().lower() == 'not available':
             pan = 'Unknown PAN'
-            
+
         for scheme in folio.get('schemes', []):
             scheme_name = scheme.get('scheme', 'Unknown Scheme')
-            # casparser hands back None (-> "None") for schemes its bundled map
-            # can't resolve; normalize that to '' and recover via the ISIN it did
-            # capture, so newer funds still get NAVs (and thus a real cost basis).
-            amfi_code = normalize_amfi(scheme.get('amfi'))
             isin = str(scheme.get('isin') or '').strip()
-            if not amfi_code and isin:
-                amfi_code = resolve_amfi_from_isin(isin)
+            # Tiered resolution (amfi -> ISIN -> saved manual override -> confident
+            # name match). casparser hands back None for newer schemes its bundled
+            # map can't resolve; without a code a fund gets no NAV and its cost
+            # basis stays 0, overstating XIRR.
+            amfi_code = resolve_scheme_code(scheme.get('amfi'), isin, scheme_name, manual_map)
             category = scheme.get('type', 'Unknown Category')
             
             # Try to get statement period start

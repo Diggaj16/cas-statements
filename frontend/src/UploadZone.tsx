@@ -4,9 +4,10 @@ import { Upload, FileText, ArrowRight, ShieldCheck } from 'lucide-react';
 interface UploadZoneProps {
   onUpload: (file: File, password: string) => void;
   isLoading: boolean;
+  error?: string | null;
 }
 
-export default function UploadZone({ onUpload, isLoading }: UploadZoneProps) {
+export default function UploadZone({ onUpload, isLoading, error }: UploadZoneProps) {
   const [file, setFile] = useState<File | null>(null);
   const [password, setPassword] = useState('');
 
@@ -39,6 +40,12 @@ export default function UploadZone({ onUpload, isLoading }: UploadZoneProps) {
 
         <h2 className="text-2xl font-bold mb-6 text-center">Upload CAS Statement</h2>
         
+        {error && (
+          <div className="mb-6 rounded-lg bg-red-500/10 border border-red-500/50 p-4 text-center">
+            <p className="text-red-400 text-sm font-medium">{error}</p>
+          </div>
+        )}
+
         <form onSubmit={handleSubmit} className="space-y-6 relative z-10">
           <div className="border-2 border-dashed border-gray-600 rounded-lg p-8 text-center hover:border-vine-indigo transition-colors cursor-pointer bg-black/20">
             <input 
@@ -89,7 +96,7 @@ export default function UploadZone({ onUpload, isLoading }: UploadZoneProps) {
 
         <div className="mt-6 flex items-center justify-center gap-2 text-sm text-gray-500">
           <ShieldCheck className="w-4 h-4" />
-          <span>Your data is processed locally and never stored.</span>
+          <span>Your PDF is processed locally and discarded. Only fund identifiers and NAVs are cached.</span>
         </div>
       </div>
     </div>

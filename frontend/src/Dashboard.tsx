@@ -3,6 +3,7 @@ import * as XLSX from 'xlsx';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import MetricCard from './MetricCard';
 import BenchmarkMapper from './BenchmarkMapper';
+import UnmatchedFundsResolver from './UnmatchedFundsResolver';
 import { Download, Table as TableIcon, FileSpreadsheet } from 'lucide-react';
 
 interface DashboardProps {
@@ -10,17 +11,20 @@ interface DashboardProps {
   onReset: () => void;
   casFile: File;
   casPassword: string;
+  onReanalyze: (mapping: { scheme: string; isin?: string; code: string; name: string }[]) => void;
+  isReanalyzing: boolean;
 }
 
-export default function Dashboard({ data, onReset, casFile, casPassword }: DashboardProps) {
-  const { liveTotalValue, liveXirr, casTotalValue, casXirr, legacyXirr, totalInvested, totalWithdrawals, netInvested, absoluteReturn, simpleCagr, fundWise, trend, holdings, transactions, casDate, dataWarnings } = data;
+export default function Dashboard({ data, onReset, casFile, casPassword, onReanalyze, isReanalyzing }: DashboardProps) {
+  const { liveTotalValue, liveXirr, casTotalValue, casXirr, totalInvested, totalWithdrawals, netInvested, absoluteReturn, simpleCagr, fundWise, trend, trendLoading, trendExcludedFunds, reconWarnings, holdings, transactions, casDate, dataWarnings, unresolvedFunds } = data;
 
   const [activeTab, setActiveTab] = useState<'overview' | 'family' | 'cagr' | 'snapshot' | 'data'>('overview');
   const [selectedPan, setSelectedPan] = useState<string>('all');
+  const [showExclTax, setShowExclTax] = useState(false);
   const [isAuditing, setIsAuditing] = useState(false);
   const [captureRatios, setCaptureRatios] = useState<Record<string, any> | null>(null);
   const [isDownloadingCas, setIsDownloadingCas] = useState(false);
-  const [trendZoom, setTrendZoom] = useState<'all' | '6m' | '3m' | '1m'>('all');
+  const [trendZoom, setTrendZoom] = useState<'all' | '6m' | '3m' | '1m' | '1y' | '2y'>('all');
   const [selectedHistDate, setSelectedHistDate] = useState<string>(casDate || '');
 
   // Daily trend points (portfolio XIRR + value per day)
@@ -29,10 +33,23 @@ export default function Dashboard({ data, onReset, casFile, casPassword }: Dashb
   // Apply zoom filter
   const filteredTrend = useMemo(() => {
     if (trendZoom === 'all') return mergedTrend;
-    const days = trendZoom === '1m' ? 30 : trendZoom === '3m' ? 90 : 180;
+    const daysMap: Record<string, number> = { '1m': 30, '3m': 90, '6m': 180, '1y': 365, '2y': 730 };
+    const days = daysMap[trendZoom] ?? 30;
     const cutoff = new Date(Date.now() - days * 86400000);
     return mergedTrend.filter((t: any) => new Date(t.date) >= cutoff);
   }, [mergedTrend, trendZoom]);
+
+  // For the chart only — in "all" view, skip the leading unstable period
+  // where XIRR is inflated by a short holding period. The full mergedTrend
+  // is still used for Value-by-Date lookups.
+  const XIRR_STABLE_PCT = 200;
+  const chartDisplayTrend = useMemo(() => {
+    if (trendZoom !== 'all') return filteredTrend;
+    const firstStable = filteredTrend.findIndex(
+      (t: any) => t.xirr != null && t.xirr <= XIRR_STABLE_PCT
+    );
+    return firstStable > 0 ? filteredTrend.slice(firstStable) : filteredTrend;
+  }, [filteredTrend, trendZoom]);
 
   // Find the closest available data point for a given date string
   const getSnapshotForDate = (dateStr: string) => {
@@ -130,23 +147,25 @@ export default function Dashboard({ data, onReset, casFile, casPassword }: Dashb
   const getDisplayMetrics = () => {
     if (selectedPan === 'all' || !data.familyBreakdown || !data.familyBreakdown[selectedPan]) {
       return {
-        liveTotalValue, liveXirr, casTotalValue, casXirr,
+        liveTotalValue, 
+        liveXirr: showExclTax ? data.exclTax?.liveXirr : liveXirr, 
+        casTotalValue, 
+        casXirr: showExclTax ? data.exclTax?.casXirr : casXirr,
         totalInvested, totalWithdrawals, netInvested, absoluteReturn,
-        totalSchemes: fundWise.length, legacyXirr
+        totalSchemes: fundWise.length
       };
     }
     const panData = data.familyBreakdown[selectedPan];
     return {
       liveTotalValue: panData.Valuation,
-      liveXirr: panData.TrueXIRR,           // pooled-cashflow XIRR for this PAN
+      liveXirr: showExclTax ? panData.TrueXIRRExclTax : panData.TrueXIRR,
       casTotalValue: panData.CASValuation,
-      casXirr: panData.CASXIRR,
+      casXirr: showExclTax ? panData.CASXIRRExclTax : panData.CASXIRR,
       totalInvested: panData.TotalInvested,
       totalWithdrawals: panData.TotalWithdrawals,
       netInvested: panData.NetInvested,
       absoluteReturn: panData.AbsoluteReturn,
-      totalSchemes: panData.TotalSchemes,
-      legacyXirr: null
+      totalSchemes: panData.TotalSchemes
     };
   };
 
@@ -193,6 +212,15 @@ export default function Dashboard({ data, onReset, casFile, casPassword }: Dashb
           </div>
         </div>
 
+        {/* Unmatched funds — search & map them, then re-analyze. */}
+        {unresolvedFunds && unresolvedFunds.length > 0 && (
+          <UnmatchedFundsResolver
+            unresolvedFunds={unresolvedFunds}
+            onApply={onReanalyze}
+            isLoading={isReanalyzing}
+          />
+        )}
+
         {/* Data quality warnings — funds whose cost basis couldn't be resolved
             are exactly the ones that drift from Investwell. */}
         {dataWarnings && dataWarnings.length > 0 && (
@@ -209,6 +237,24 @@ export default function Dashboard({ data, onReset, casFile, casPassword }: Dashb
         )}
 
         {/* Top Level Metrics */}
+        <div className="flex justify-between items-end mb-4">
+          <h2 className="text-xl font-bold font-heading text-vine-indigo">Headline Metrics</h2>
+          {data.exclTax && (
+            <label className="flex items-center gap-2 cursor-pointer bg-white/5 px-3 py-1.5 rounded-lg border border-white/10 hover:bg-white/10 transition-colors">
+              <span className={`text-xs font-medium ${!showExclTax ? 'text-vine-mint' : 'text-gray-400'}`}>True XIRR</span>
+              <div className="relative inline-block w-8 h-4 bg-gray-700 rounded-full">
+                <input 
+                  type="checkbox" 
+                  className="peer sr-only" 
+                  checked={showExclTax}
+                  onChange={(e) => setShowExclTax(e.target.checked)}
+                />
+                <span className="absolute left-0.5 top-0.5 w-3 h-3 bg-white rounded-full transition-all peer-checked:translate-x-4 peer-checked:bg-vine-peach"></span>
+              </div>
+              <span className={`text-xs font-medium ${showExclTax ? 'text-vine-peach' : 'text-gray-400'}`}>Excl-Tax</span>
+            </label>
+          )}
+        </div>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
           <MetricCard
             title="Live Valuation"
@@ -300,7 +346,7 @@ export default function Dashboard({ data, onReset, casFile, casPassword }: Dashb
                   <div className="flex items-center gap-3 flex-wrap">
                     {/* Zoom pills */}
                     <div className="flex gap-1 bg-white/5 rounded-lg p-1">
-                      {(['1m', '3m', '6m', 'all'] as const).map(z => (
+                      {(['1m', '3m', '6m', '1y', '2y', 'all'] as const).map(z => (
                         <button
                           key={z}
                           onClick={() => setTrendZoom(z)}
@@ -326,15 +372,38 @@ export default function Dashboard({ data, onReset, casFile, casPassword }: Dashb
                     Excel export covers: 5 days before CAS date ({casDate}) → today
                   </p>
                 )}
+                {trendZoom === 'all' && chartDisplayTrend.length < filteredTrend.length && !trendLoading && (
+                  <p className="text-xs text-gray-500 mb-3">
+                    Early period hidden — XIRR was inflated ({'>'}200%) while the portfolio was newly started.
+                    Showing from <strong>{chartDisplayTrend[0]?.date}</strong>.
+                  </p>
+                )}
+                {trendExcludedFunds && trendExcludedFunds.length > 0 && !trendLoading && (
+                  <p className="text-xs text-amber-500/80 mb-3">
+                    Excluded from trend: {trendExcludedFunds.join(', ')} (no NAV history).
+                  </p>
+                )}
+                {reconWarnings && reconWarnings.length > 0 && !trendLoading && (
+                  <div className="mb-3 rounded text-amber-500/80 bg-amber-500/10 p-3 text-xs">
+                    <p className="font-semibold mb-1">⚠ Unit Reconciliation Drift Detected</p>
+                    <ul className="list-disc pl-5">
+                      {reconWarnings.map((w: string, i: number) => <li key={i}>{w}</li>)}
+                    </ul>
+                  </div>
+                )}
                 <div className="h-[400px]">
-                  {filteredTrend.length === 0 ? (
+                  {trendLoading ? (
+                    <div className="h-full flex items-center justify-center text-gray-400 text-sm">
+                      <span className="animate-pulse">Computing trend...</span>
+                    </div>
+                  ) : filteredTrend.length === 0 ? (
                     <div className="h-full flex items-center justify-center text-gray-600 text-sm">
                       Upload a CAS to see the XIRR trend chart.
                     </div>
                   ) : (
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart
-                      data={filteredTrend}
+                      data={chartDisplayTrend}
                       margin={{ top: 5, right: 30, left: 20, bottom: 5 }}
                     >
                       <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
@@ -537,7 +606,7 @@ export default function Dashboard({ data, onReset, casFile, casPassword }: Dashb
                     className="bg-gray-800 border border-gray-600 rounded-lg px-4 py-2 text-white text-sm focus:outline-none focus:border-vine-indigo [color-scheme:dark]"
                   />
                 </div>
-                {histSnapshot && selectedHistDate !== histSnapshot.date && (
+                {histSnapshot && selectedHistDate !== histSnapshot.date && !trendLoading && (
                   <p className="text-xs text-yellow-400 mt-4 sm:mt-5">
                     No data for {selectedHistDate} (weekend/holiday) — showing nearest trading day: <strong>{histSnapshot.date}</strong>
                   </p>
@@ -545,7 +614,11 @@ export default function Dashboard({ data, onReset, casFile, casPassword }: Dashb
               </div>
             </div>
 
-            {histSnapshot && (
+            {trendLoading ? (
+              <div className="glass-card p-10 flex justify-center items-center">
+                <span className="animate-pulse text-gray-400">Computing trend...</span>
+              </div>
+            ) : histSnapshot && (
               <>
                 {/* Main snapshot metrics */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
@@ -633,7 +706,7 @@ export default function Dashboard({ data, onReset, casFile, casPassword }: Dashb
               </>
             )}
 
-            {!histSnapshot && (
+            {!histSnapshot && !trendLoading && (
               <div className="glass-card p-10 text-center text-gray-500">
                 No historical data available for the selected date.
               </div>

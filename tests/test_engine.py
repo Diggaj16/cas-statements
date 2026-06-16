@@ -2,10 +2,10 @@ import unittest
 import pandas as pd
 import numpy as np
 from datetime import datetime, date, timedelta
-from metrics import (calculate_xirr, xirr_from_scratch, build_portfolio_history,
-                     calculate_capture_ratios, calculate_xirr_legacy,
+from metrics import (calculate_xirr, build_portfolio_history,
+                     calculate_capture_ratios,
                      compute_invested_withdrawn, prepare_base_cashflows,
-                     calculate_xirr_fast)
+                     calculate_xirr_fast, compute_daily_portfolio_value)
 
 class TestMetrics(unittest.TestCase):
     def test_calculate_xirr_basic_positive(self):
@@ -47,11 +47,7 @@ class TestMetrics(unittest.TestCase):
         xirr_val, _ = calculate_xirr(transactions, 0.0, pd.Timestamp('2023-12-31').date())
         self.assertIsNone(xirr_val)
 
-    def test_xirr_from_scratch(self):
-        dates = [date(2023,1,1), date(2023,12,31)]
-        amounts = [-10000.0, 11000.0]
-        r = xirr_from_scratch(dates, amounts)
-        self.assertAlmostEqual(r, 0.10027, places=4)
+
 
     def test_build_portfolio_history_twr(self):
         # Mock transactions
@@ -188,15 +184,7 @@ class TestXirrStandardMethodology(unittest.TestCase):
         self.assertIsNotNone(x_val)
         self.assertAlmostEqual(x_val, 0.10027, places=4)
 
-    def test_legacy_xirr_returns_value(self):
-        # Was always None due to a NameError (final_df vs final_cf).
-        txns = pd.DataFrame([
-            {'Date': pd.Timestamp('2023-01-01'), 'Amount': 10000.0, 'Type': 'PURCHASE', 'Units': 100.0, 'Scheme': 'A'},
-        ])
-        val_date = pd.Timestamp('2023-12-31').date()
-        r = calculate_xirr_legacy(txns, 11000.0, val_date)
-        self.assertIsNotNone(r)
-        self.assertAlmostEqual(r, 0.10027, places=4)
+
 
     def test_misc_no_unit_rows_excluded(self):
         # Unclassifiable zero-unit rows (MISC) must not become phantom inflows.
@@ -283,6 +271,74 @@ class TestXirrStandardMethodology(unittest.TestCase):
         x_val, _ = calculate_xirr(txns, 10000.0, pd.Timestamp('2024-01-01').date())
         self.assertIsNotNone(x_val)
         self.assertAlmostEqual(x_val, 0.0, places=6)
+
+
+class TestDailyPortfolioValue(unittest.TestCase):
+    """The trend/Value-by-Date helper must value each past day with the units
+    actually held THAT day (net cumulative), not today's holdings."""
+
+    def _nav(self, date_range, value=10.0):
+        return pd.DataFrame({'nav': [value] * len(date_range)}, index=date_range)
+
+    def test_uses_historical_units_not_current(self):
+        # Buy 100 on Jan 1, buy 100 more on Jan 3, sell 50 on Jan 5 -> hold 150.
+        # NAV flat at 10 so value == units * 10 and we can read units off the value.
+        date_range = pd.date_range('2023-01-01', '2023-01-06', freq='D')
+        txns = pd.DataFrame([
+            {'Date': pd.Timestamp('2023-01-01'), 'Units': 100.0, 'Scheme': 'A'},
+            {'Date': pd.Timestamp('2023-01-03'), 'Units': 100.0, 'Scheme': 'A'},
+            {'Date': pd.Timestamp('2023-01-05'), 'Units': -50.0, 'Scheme': 'A'},
+        ])
+        navs = {'111': self._nav(date_range)}
+        daily, skipped = compute_daily_portfolio_value(txns, navs, date_range, {'A': '111'})
+
+        self.assertEqual(skipped, [])
+        # Before the 2nd buy: 100 units (NOT today's 150) -> 1000
+        self.assertAlmostEqual(daily.loc['2023-01-02'], 1000.0)
+        # After 2nd buy, before the sell: 200 units -> 2000
+        self.assertAlmostEqual(daily.loc['2023-01-04'], 2000.0)
+        # On/after the sell: 150 units -> 1500
+        self.assertAlmostEqual(daily.loc['2023-01-05'], 1500.0)
+
+    def test_final_day_reconciles_to_current_holdings(self):
+        # The last day's units must equal the sum of every unit-changing row
+        # (so it reconciles to the holdings the analyze endpoint reports).
+        date_range = pd.date_range('2023-01-01', '2023-01-06', freq='D')
+        txns = pd.DataFrame([
+            {'Date': pd.Timestamp('2023-01-01'), 'Units': 100.0, 'Scheme': 'A'},
+            {'Date': pd.Timestamp('2023-01-03'), 'Units': 100.0, 'Scheme': 'A'},
+            {'Date': pd.Timestamp('2023-01-05'), 'Units': -50.0, 'Scheme': 'A'},
+        ])
+        navs = {'111': self._nav(date_range)}
+        daily, _ = compute_daily_portfolio_value(txns, navs, date_range, {'A': '111'})
+        current_units = txns['Units'].sum()  # 150
+        self.assertAlmostEqual(daily.iloc[-1], current_units * 10.0)
+
+    def test_multiplies_by_that_days_nav(self):
+        # Value must track NAV, not just units.
+        date_range = pd.date_range('2023-01-01', '2023-01-03', freq='D')
+        txns = pd.DataFrame([
+            {'Date': pd.Timestamp('2023-01-01'), 'Units': 10.0, 'Scheme': 'A'},
+        ])
+        nav_df = pd.DataFrame({'nav': [10.0, 20.0, 30.0]}, index=date_range)
+        daily, _ = compute_daily_portfolio_value(txns, {'111': nav_df}, date_range, {'A': '111'})
+        self.assertAlmostEqual(daily.loc['2023-01-01'], 100.0)
+        self.assertAlmostEqual(daily.loc['2023-01-03'], 300.0)
+
+    def test_fund_without_nav_is_skipped_not_zeroed_across_history(self):
+        # A fund with no NAV must be reported as skipped and contribute nothing,
+        # rather than back-projecting its current value onto every past day.
+        date_range = pd.date_range('2023-01-01', '2023-01-03', freq='D')
+        txns = pd.DataFrame([
+            {'Date': pd.Timestamp('2023-01-01'), 'Units': 100.0, 'Scheme': 'A'},
+            {'Date': pd.Timestamp('2023-01-01'), 'Units': 50.0, 'Scheme': 'B'},
+        ])
+        navs = {'111': self._nav(date_range)}  # only A has NAV
+        daily, skipped = compute_daily_portfolio_value(
+            txns, navs, date_range, {'A': '111', 'B': '222'})
+        self.assertEqual(skipped, ['B'])
+        # Only A (100 units * 10) contributes; B adds nothing.
+        self.assertAlmostEqual(daily.iloc[-1], 1000.0)
 
 
 if __name__ == '__main__':

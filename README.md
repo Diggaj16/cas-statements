@@ -1,31 +1,41 @@
-# CAS Statements Analyzer
+# CAS Analyzer & True Portfolio XIRR Engine
 
-A functional dashboard and analytical tool for deep financial analysis. Designed for financial advisors, this tool ingests complex CAS statements and extracts clear, accurate performance metrics to present to clients. 
+A robust, full-stack application that parses Consolidated Account Statements (CAS) from CAMS/KFintech and calculates your exact, true portfolio XIRR. The engine is explicitly designed to solve edge cases where standard aggregators (like Investwell) fail, while allowing you to toggle calculation methodologies to achieve parity with them.
 
-It exists to replace tedious Excel crunching with instant, mathematically rigorous Time-Weighted Returns (TWR), XIRR, and Capture Ratios based on official CAS PDF data.
+## Key Features
 
-## Features
+- **True Portfolio XIRR**: Calculates an exact XIRR by mapping all historical cash flows directly to live, up-to-date NAVs fetched via AMFI APIs.
+- **Family & PAN Breakdown**: Groups folios intelligently, preventing data cross-contamination when the same mutual fund scheme is held across different PANs within a family CAS.
+- **Benchmark Audit**: Compare the Time-Weighted Returns (Capture Ratios) of any scheme against standard NSE benchmarks.
+- **Unmatched Funds Resolver**: Manual price mapping for Alternative Investment Funds (AIFs) or missing schemes directly in the UI.
 
-- **Automated CAS Parsing**: Replaces tedious manual Excel crunching.
-- **Advanced Metrics**: Calculates mathematically rigorous Time-Weighted Returns, XIRR, and Capture Ratios.
-- **Institutional-Grade UI**: A clean, subdued, professional dashboard that prioritizes clarity, data density, and precision without clutter.
+---
 
-## Setup & Run
+## 📐 XIRR Calculation Methodology
 
-### Backend (Python)
-Ensure you have Python installed. You can install the dependencies via:
-```bash
-pip install -r requirements.txt
-```
+Mutual fund statements are highly complex, containing internal transfers, tax deductions, missing NAVs, and reversals. The analyzer uses the following strict cash flow methodology:
 
-### Frontend (React/Node)
-Navigate to the `frontend` directory and install the necessary packages:
-```bash
-cd frontend
-npm install
-npm run dev
-```
+### 1. Internal Switch Deduplication (Pooled XIRR)
+At the **Portfolio** or **PAN Level**, a switch from Fund A to Fund B is merely money moving from one pocket to another. 
+- The engine scans the transaction ledger and pairs `SWITCH OUT` and `SWITCH IN` transactions that occur within a 7-day window and match in monetary amount. 
+- These paired internal transfers are **excluded** from the top-level cash flow calculation, preventing massive artificial cash flow spikes that distort your XIRR.
+- However, at the **Category** and **Scheme Level**, these switches are correctly preserved as genuine inflows/outflows for that specific bucket.
 
-## Structure
-- `frontend/`: The frontend application interface.
-- Core python files (`main.py`, `metrics.py`, `parser.py`): Backend logic for parsing and financial calculations.
+### 2. The "Excl-Tax" Toggle (Investwell Parity)
+Aggregators like Investwell compute a theoretical XIRR that ignores real-world friction. 
+- **True XIRR (Default)**: Accounts for Stamp Duty, STT (Securities Transaction Tax), and TDS. These are treated as lost money (outflows that never purchased units or were withheld from proceeds), resulting in a mathematically pure but slightly lower XIRR.
+- **Excl-Tax XIRR**: Flipping the toggle on the dashboard drops these tax lines entirely, creating perfect parity with Investwell's reporting.
+
+### 3. Missing NAVs & AIF Handling
+Standard aggregators completely fail or drop funds that aren't publicly listed (like AIFs or PMS).
+- The engine uses the explicit valuation injected by the CAS statement as a fallback. 
+- For the historical trend chart, it linearly interpolates this fallback NAV backward to your original purchase dates. This prevents artificial drop-offs in the trendline and ensures the AIF's valuation is perfectly accounted for across time.
+
+### 4. Trend Downsampling & Performance
+Calculating daily XIRR across thousands of days and transactions is computationally intensive. 
+- The engine groups raw cashflows into an $O(1)$ iterable DataFrame.
+- It calculates XIRR daily for the last 180 days, but downsamples older data (Fridays only, plus specific CAS boundaries) to deliver instant chart rendering without sacrificing the accuracy of the final data point.
+
+## Tech Stack
+- **Backend**: Python (FastAPI, Pandas, scipy.optimize for XIRR, casparser)
+- **Frontend**: React (TypeScript, Vite, Tailwind CSS, Recharts for trending)

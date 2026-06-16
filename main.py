@@ -11,8 +11,8 @@ import traceback
 import json
 
 from parser import parse_cas, extract_transactions, get_current_valuation
-from metrics import calculate_xirr, calculate_xirr_legacy, calculate_xirr_fast, prepare_base_cashflows, build_portfolio_history, calculate_capture_ratios, compute_invested_withdrawn
-from mf_api import fetch_historical_nav
+from metrics import calculate_xirr, calculate_xirr_fast, prepare_base_cashflows, build_portfolio_history, calculate_capture_ratios, compute_invested_withdrawn, compute_daily_portfolio_value
+from mf_api import fetch_historical_nav, get_manual_map, save_manual_override, cache as nav_cache
 from src.exporter import generate_cas_excel, generate_audit_excel
 
 try:
@@ -68,10 +68,147 @@ async def version():
     """Marker for verifying which code revision the running server has loaded."""
     return {"methodology": "standard-xirr-v2"}
 
+@app.get("/api/search-scheme")
+async def search_scheme(q: str):
+    """Proxy mfapi's scheme search so the manual-mapping UI can let the user pick
+    the exact scheme (code + full name with plan/option) for an unmatched fund.
+    """
+    q = (q or "").strip()
+    if len(q) < 3:
+        return {"results": []}
+    cache_key = f"__scheme_search__{q.lower()}"
+    cached = nav_cache.get(cache_key)
+    if cached is not None:
+        return {"results": cached}
+    try:
+        import requests
+        resp = requests.get("https://api.mfapi.in/mf/search", params={"q": q}, timeout=10)
+        resp.raise_for_status()
+        results = [
+            {"code": str(item.get("schemeCode")), "name": item.get("schemeName")}
+            for item in resp.json()
+            if item.get("schemeCode")
+        ]
+        nav_cache.set(cache_key, results, expire=86400)
+        return {"results": results}
+    except Exception as e:
+        logger.warning(f"Scheme search failed for '{q}': {e}")
+        return {"results": []}
+
+def process_cas_and_valuation(cas_tmp_path, cas_password, manual_mapping=None):
+    parsed_data = parse_cas(cas_tmp_path, cas_password)
+
+    if manual_mapping:
+        try:
+            for entry in json.loads(manual_mapping):
+                save_manual_override(entry.get('scheme'), entry.get('isin'), entry.get('code'))
+        except Exception as e:
+            logger.warning(f"Could not apply manual_mapping: {e}")
+    transactions_df = extract_transactions(parsed_data, manual_map=get_manual_map())
+
+    import concurrent.futures
+    amfi_codes = set(transactions_df['AMFI'].dropna().unique())
+    valid_amfis = [str(a).strip() for a in amfi_codes if str(a).strip()]
+    
+    if valid_amfis:
+        def preload_nav(amfi):
+            fetch_historical_nav(amfi)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            executor.map(preload_nav, valid_amfis)
+
+    total_value, holdings_df, latest_val_date = get_current_valuation(parsed_data)
+
+    data_warnings = []
+    unresolved_funds = []
+    seen_unresolved = set()
+    for _, r in transactions_df.iterrows():
+        if str(r.get('AMFI') or '').strip():
+            continue
+        scheme = r.get('Scheme')
+        if scheme in seen_unresolved:
+            continue
+        seen_unresolved.add(scheme)
+        unresolved_funds.append({
+            "scheme": scheme,
+            "isin": str(r.get('ISIN') or '').strip(),
+            "pan": r.get('PAN'),
+            "category": r.get('Category'),
+        })
+
+    txn_nav_df = transactions_df[(transactions_df['Type'] != 'OPENING_BALANCE') & (transactions_df['NAV'] > 0)]
+    earliest_txn_nav = {}
+    if not txn_nav_df.empty:
+        for scheme, grp in txn_nav_df.sort_values('Date').groupby('Scheme'):
+            earliest_txn_nav[scheme] = float(grp['NAV'].iloc[0])
+    cas_val_nav = {}
+    if not holdings_df.empty:
+        for _, h in holdings_df.iterrows():
+            if h.get('NAV'):
+                cas_val_nav[h['Scheme']] = float(h['NAV'])
+
+    opening_mask = transactions_df['Type'] == 'OPENING_BALANCE'
+    if opening_mask.any():
+        for idx, row in transactions_df[opening_mask].iterrows():
+            amfi = row['AMFI']
+            open_date = row['Date']
+            units = row['Units']
+            scheme = row['Scheme']
+            nav_df = fetch_historical_nav(amfi) if (amfi and str(amfi).strip()) else None
+            if nav_df is not None and not nav_df.empty and pd.notna(open_date):
+                try:
+                    dt = pd.to_datetime(open_date)
+                    navs_until = nav_df.loc[:dt]['nav']
+                    closest_nav = navs_until.iloc[-1] if not navs_until.empty else nav_df['nav'].iloc[0]
+                    transactions_df.at[idx, 'Amount'] = float(units * closest_nav)
+                    transactions_df.at[idx, 'NAV'] = float(closest_nav)
+                except Exception as e:
+                    logger.warning(f"Failed to fix opening balance for {amfi}: {e}")
+            else:
+                fallback_nav = earliest_txn_nav.get(scheme) or cas_val_nav.get(scheme)
+                if fallback_nav and units:
+                    transactions_df.at[idx, 'Amount'] = float(units * fallback_nav)
+                    transactions_df.at[idx, 'NAV'] = float(fallback_nav)
+                    data_warnings.append(
+                        f"{scheme}: no NAV history — opening cost estimated from a nearby NAV. Map this fund for an exact figure."
+                    )
+                else:
+                    logger.warning(f"No NAV data for {scheme}; opening balance has no cost and XIRR may be overstated")
+                    data_warnings.append(
+                        f"{scheme}: could not be priced (no AMFI/NAV) — opening-balance cost is missing, so its XIRR is overstated. Map this fund to fix it."
+                    )
+
+    live_total_value = 0.0
+    live_date = datetime.now().date()
+    scheme_amfi_map = transactions_df[['Scheme', 'AMFI']].drop_duplicates().set_index('Scheme')['AMFI'].to_dict()
+    
+    if not holdings_df.empty:
+        for i, row in holdings_df.iterrows():
+            scheme = row['Scheme']
+            units = row['Units']
+            amfi = scheme_amfi_map.get(scheme)
+            
+            live_nav = row['NAV']
+            if amfi and str(amfi).strip():
+                nav_df = fetch_historical_nav(amfi)
+                if nav_df is not None and not nav_df.empty:
+                    live_nav = nav_df['nav'].iloc[-1]
+            
+            val = units * live_nav
+            if val == 0.0 and row['Value'] > 0:
+                val = row['Value']
+                
+            live_total_value += val
+            holdings_df.at[i, 'Live NAV'] = live_nav
+            holdings_df.at[i, 'Live Value'] = val
+
+    return (transactions_df, holdings_df, total_value, latest_val_date, 
+            live_total_value, live_date, data_warnings, unresolved_funds, scheme_amfi_map, valid_amfis)
+
 @app.post("/api/analyze")
 async def analyze_cas(
     cas_file: UploadFile = File(...),
-    cas_password: str = Form(...)
+    cas_password: str = Form(...),
+    manual_mapping: str = Form(None)
 ):
     cas_tmp_path = None
     try:
@@ -81,90 +218,13 @@ async def analyze_cas(
             tmp.write(content)
             cas_tmp_path = tmp.name
 
-        parsed_data = parse_cas(cas_tmp_path, cas_password)
-        transactions_df = extract_transactions(parsed_data)
-        
-        # 2. Pre-fetch NAVs
-        import concurrent.futures
-        amfi_codes = set(transactions_df['AMFI'].dropna().unique())
-        valid_amfis = [str(a).strip() for a in amfi_codes if str(a).strip()]
-        
-        if valid_amfis:
-            def preload_nav(amfi):
-                fetch_historical_nav(amfi)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                executor.map(preload_nav, valid_amfis)
-
-        # Schemes whose cost basis / valuation can't be trusted because no NAV
-        # could be resolved — these are exactly the funds that drift from
-        # Investwell, so we surface them to the user instead of failing silently.
-        data_warnings = []
-
-        # 3. Fix opening balances
-        opening_mask = transactions_df['Type'] == 'OPENING_BALANCE'
-        if opening_mask.any():
-            for idx, row in transactions_df[opening_mask].iterrows():
-                amfi = row['AMFI']
-                open_date = row['Date']
-                units = row['Units']
-                if amfi and str(amfi).strip() and pd.notna(open_date):
-                    nav_df = fetch_historical_nav(amfi)
-                    if nav_df is not None and not nav_df.empty:
-                        try:
-                            dt = pd.to_datetime(open_date)
-                            navs_until = nav_df.loc[:dt]['nav']
-                            # If NAV history starts after the opening date, fall back to
-                            # the earliest available NAV. Leaving Amount at 0 would drop
-                            # the opening outflow from XIRR while its units still count
-                            # in the valuation, wildly inflating returns.
-                            closest_nav = navs_until.iloc[-1] if not navs_until.empty else nav_df['nav'].iloc[0]
-                            transactions_df.at[idx, 'Amount'] = float(units * closest_nav)
-                            transactions_df.at[idx, 'NAV'] = float(closest_nav)
-                        except Exception as e:
-                            logger.warning(f"Failed to fix opening balance for {amfi}: {e}")
-                    else:
-                        logger.warning(f"No NAV data for {amfi}; opening balance has no cost and XIRR may be overstated")
-                        data_warnings.append(
-                            f"{row['Scheme']}: no NAV found (AMFI '{amfi}'), opening-balance cost is missing — XIRR for this fund is overstated."
-                        )
-                elif pd.notna(open_date):
-                    # Opening units carried forward but the fund has no resolvable
-                    # AMFI/ISIN at all — its cost basis stays 0 and skews XIRR.
-                    data_warnings.append(
-                        f"{row['Scheme']}: no AMFI code (could not resolve from ISIN), opening-balance cost is missing — XIRR for this fund is overstated."
-                    )
-
-        total_value, holdings_df, latest_val_date = get_current_valuation(parsed_data)
-
-        # 4. Live NAV calculation
-        live_total_value = 0.0
-        live_date = datetime.now().date()
-        scheme_amfi_map = transactions_df[['Scheme', 'AMFI']].drop_duplicates().set_index('Scheme')['AMFI'].to_dict()
-        
-        if not holdings_df.empty:
-            for i, row in holdings_df.iterrows():
-                scheme = row['Scheme']
-                units = row['Units']
-                amfi = scheme_amfi_map.get(scheme)
-                
-                live_nav = row['NAV']
-                if amfi and str(amfi).strip():
-                    nav_df = fetch_historical_nav(amfi)
-                    if nav_df is not None and not nav_df.empty:
-                        live_nav = nav_df['nav'].iloc[-1]
-                
-                val = units * live_nav
-                if val == 0.0 and row['Value'] > 0:
-                    val = row['Value']
-                    
-                live_total_value += val
-                holdings_df.at[i, 'Live NAV'] = live_nav
-                holdings_df.at[i, 'Live Value'] = val
+        (transactions_df, holdings_df, total_value, latest_val_date,
+         live_total_value, live_date, data_warnings, unresolved_funds,
+         scheme_amfi_map, valid_amfis) = process_cas_and_valuation(cas_tmp_path, cas_password, manual_mapping)
 
         # 5. Core XIRR — pooled portfolio level, so switches are internal transfers
         live_xirr_val, _ = calculate_xirr(transactions_df, live_total_value, live_date, include_switches=False)
         cas_xirr_val, _ = calculate_xirr(transactions_df, total_value, latest_val_date, include_switches=False)
-        legacy_xirr_val = calculate_xirr_legacy(transactions_df, total_value, latest_val_date)
 
         # Investwell-style parity set: stamp duty/STT/TDS lines excluded
         live_xirr_notax, _ = calculate_xirr(transactions_df, live_total_value, live_date, include_switches=False, include_taxes=False)
@@ -174,15 +234,15 @@ async def analyze_cas(
         valid_funds = []
         
         # We will build a structured dictionary for the new Family & Category tab
-        # Structure: { PAN: { "Valuation": 0, "TrueXIRR": 0, "WeightedXIRR": 0, "Categories": { CATEGORY: { "Valuation": 0, "TrueXIRR": 0, "WeightedXIRR": 0, "Funds": [] } } } }
+        # Structure: { PAN: { "Valuation": 0, "TrueXIRR": 0, "Categories": { CATEGORY: { "Valuation": 0, "TrueXIRR": 0, "Funds": [] } } } }
         family_breakdown = {}
         
-        for scheme, scheme_txns in transactions_df.groupby('Scheme'):
-            val_row = holdings_df[holdings_df['Scheme'] == scheme]
+        for (pan, scheme), scheme_txns in transactions_df.groupby(['PAN', 'Scheme']):
+            # Filter holdings_df by both Scheme and PAN
+            val_row = holdings_df[(holdings_df['Scheme'] == scheme) & (holdings_df['PAN'] == pan)] if 'PAN' in holdings_df.columns else holdings_df[holdings_df['Scheme'] == scheme]
             live_scheme_val = val_row['Live Value'].sum() if not val_row.empty and 'Live Value' in val_row.columns else 0.0
             cas_scheme_val = val_row['Value'].sum() if not val_row.empty else 0.0
             
-            pan = scheme_txns['PAN'].iloc[0] if 'PAN' in scheme_txns.columns else 'Unknown PAN'
             category = scheme_txns['Category'].iloc[0] if 'Category' in scheme_txns.columns else 'Unknown Category'
 
             # Scheme level invested and withdrawals: switches are real flows here
@@ -202,7 +262,6 @@ async def analyze_cas(
                 
             live_x_val = calculate_xirr(scheme_txns, live_scheme_val, live_date)[0]
             cas_x_val = calculate_xirr(scheme_txns, cas_scheme_val, latest_val_date)[0]
-            legacy_val = calculate_xirr_legacy(scheme_txns, cas_scheme_val, latest_val_date)
             live_x_notax = calculate_xirr(scheme_txns, live_scheme_val, live_date, include_taxes=False)[0]
             cas_x_notax = calculate_xirr(scheme_txns, cas_scheme_val, latest_val_date, include_taxes=False)[0]
 
@@ -213,7 +272,6 @@ async def analyze_cas(
                 "LiveXIRR": live_x_val * 100 if live_x_val is not None else None,
                 "CASValuation": cas_scheme_val,
                 "CASXIRR": cas_x_val * 100 if cas_x_val is not None else None,
-                "LegacyXIRR": legacy_val * 100 if legacy_val is not None else None,
                 "LiveXIRRExclTax": live_x_notax * 100 if live_x_notax is not None else None,
                 "CASXIRRExclTax": cas_x_notax * 100 if cas_x_notax is not None else None,
                 "PAN": pan,
@@ -254,9 +312,15 @@ async def analyze_cas(
             pan_true_xirr, _ = calculate_xirr(pan_txns, pan_val, live_date, include_switches=False)
             pan_data["TrueXIRR"] = pan_true_xirr * 100 if pan_true_xirr is not None else None
 
+            pan_true_xirr_notax, _ = calculate_xirr(pan_txns, pan_val, live_date, include_switches=False, include_taxes=False)
+            pan_data["TrueXIRRExclTax"] = pan_true_xirr_notax * 100 if pan_true_xirr_notax is not None else None
+
             # PAN CAS XIRR
             pan_cas_xirr, _ = calculate_xirr(pan_txns, cas_pan_val, latest_val_date, include_switches=False)
             pan_data["CASXIRR"] = pan_cas_xirr * 100 if pan_cas_xirr is not None else None
+
+            pan_cas_xirr_notax, _ = calculate_xirr(pan_txns, cas_pan_val, latest_val_date, include_switches=False, include_taxes=False)
+            pan_data["CASXIRRExclTax"] = pan_cas_xirr_notax * 100 if pan_cas_xirr_notax is not None else None
 
             # Additions and Withdrawals for PAN — out-of-pocket, switches internal
             pan_invested, pan_withdrawals = compute_invested_withdrawn(pan_txns)
@@ -271,46 +335,7 @@ async def analyze_cas(
                 pan_abs_return = ((pan_val - pan_data["NetInvested"]) / pan_data["NetInvested"]) * 100
             pan_data["AbsoluteReturn"] = pan_abs_return
 
-        # 6. Daily XIRR trend — portfolio only, parallelized
-        trend = []
-        if not holdings_df.empty:
-            first_txn_date = pd.to_datetime(transactions_df['Date'].min()).date()
-            date_range = pd.date_range(start=first_txn_date, end=live_date, freq='D')
-
-            df_navs = pd.DataFrame(index=date_range)
-            for amfi in valid_amfis:
-                nav_df = fetch_historical_nav(amfi)
-                if nav_df is not None and not nav_df.empty:
-                    df_navs[amfi] = nav_df['nav'].reindex(date_range, method='ffill').bfill()
-
-            daily_port_val = pd.Series(0.0, index=date_range)
-            for _, row in holdings_df.iterrows():
-                amfi = scheme_amfi_map.get(row['Scheme'])
-                units = row['Units']
-                if amfi and amfi in df_navs.columns:
-                    daily_port_val += df_navs[amfi] * units
-                else:
-                    daily_port_val += row.get('Value', 0.0)
-
-            base_cf_df = prepare_base_cashflows(transactions_df, include_switches=False)
-            dates_list = list(date_range)
-            vals_list = list(daily_port_val.values)
-
-            def _xirr_for_day(args):
-                d, val = args
-                d_obj = d.date()
-                x = calculate_xirr_fast(base_cf_df, float(val), d_obj)
-                if x is None or not math.isfinite(x):
-                    return None
-                xirr_pct = x * 100
-                # Annualized XIRR explodes on near-zero-duration early days; drop the noise.
-                if not math.isfinite(xirr_pct) or abs(xirr_pct) > 1000:
-                    return None
-                return {"date": d_obj.strftime("%Y-%m-%d"), "xirr": xirr_pct, "portfolioValue": float(val)}
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-                results = list(ex.map(_xirr_for_day, zip(dates_list, vals_list)))
-            trend = sorted([r for r in results if r is not None], key=lambda r: r["date"])
+        # 6. Trend calculation moved to /api/trend endpoint
 
         # 8. Total Additions & Withdrawals — out-of-pocket, switches internal
         total_invested, total_withdrawals = compute_invested_withdrawn(transactions_df)
@@ -341,15 +366,9 @@ async def analyze_cas(
             "liveXirr": live_xirr_val * 100 if live_xirr_val is not None else None,
             "casTotalValue": total_value,
             "casXirr": cas_xirr_val * 100 if cas_xirr_val is not None else None,
-            "legacyXirr": legacy_xirr_val * 100 if legacy_xirr_val is not None else None,
-            "liveWeightedXirr": live_weighted_xirr_val * 100 if live_weighted_xirr_val is not None else None,
-            "casWeightedXirr": cas_weighted_xirr_val * 100 if cas_weighted_xirr_val is not None else None,
-            "weightedXirr": cas_weighted_xirr_val * 100 if cas_weighted_xirr_val is not None else None,
             "exclTax": {
                 "liveXirr": live_xirr_notax * 100 if live_xirr_notax is not None else None,
                 "casXirr": cas_xirr_notax * 100 if cas_xirr_notax is not None else None,
-                "liveWeightedXirr": live_weighted_notax * 100 if live_weighted_notax is not None else None,
-                "casWeightedXirr": cas_weighted_notax * 100 if cas_weighted_notax is not None else None,
             },
             "totalInvested": total_invested,
             "totalWithdrawals": total_withdrawals,
@@ -359,8 +378,7 @@ async def analyze_cas(
             "fundWise": fund_xirrs,
             "familyBreakdown": family_breakdown,
             "dataWarnings": data_warnings,
-            "trend": trend,
-            "weightedTrend": weighted_trend,
+            "unresolvedFunds": unresolved_funds,
             "transactions": transactions_df.fillna("").to_dict(orient="records"),
             "holdings": holdings_df.fillna("").to_dict(orient="records")
         })
@@ -512,71 +530,61 @@ async def get_trend(
             tmp.write(content)
             cas_tmp_path = tmp.name
 
-        parsed_data = parse_cas(cas_tmp_path, cas_password)
-        transactions_df = extract_transactions(parsed_data)
-        _, holdings_df, latest_val_date = get_current_valuation(parsed_data)
+        (transactions_df, holdings_df, total_value, latest_val_date,
+         live_total_value, live_date, data_warnings, unresolved_funds,
+         scheme_amfi_map, valid_amfis) = process_cas_and_valuation(cas_tmp_path, cas_password)
 
-        import concurrent.futures
-
-        amfi_codes = set(transactions_df['AMFI'].dropna().unique())
-        valid_amfis = [str(a).strip() for a in amfi_codes if str(a).strip()]
-
-        # NAVs are already cached from /api/analyze — this is fast
-        if valid_amfis:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-                ex.map(fetch_historical_nav, valid_amfis)
-
-        # Fix opening balance amounts so base cashflows are correct
-        opening_mask = transactions_df['Type'] == 'OPENING_BALANCE'
-        if opening_mask.any():
-            for idx, row in transactions_df[opening_mask].iterrows():
-                amfi = row['AMFI']
-                open_date = row['Date']
-                units = row['Units']
-                if amfi and str(amfi).strip() and pd.notna(open_date):
-                    nav_df = fetch_historical_nav(amfi)
-                    if nav_df is not None and not nav_df.empty:
-                        try:
-                            dt = pd.to_datetime(open_date)
-                            navs_until = nav_df.loc[:dt]['nav']
-                            closest_nav = navs_until.iloc[-1] if not navs_until.empty else nav_df['nav'].iloc[0]
-                            transactions_df.at[idx, 'Amount'] = float(units * closest_nav)
-                        except Exception as e:
-                            logger.warning(f"Trend: opening balance fix failed for {amfi}: {e}")
-
-        live_date = datetime.now().date()
-        scheme_amfi_map = (
-            transactions_df[['Scheme', 'AMFI']]
-            .drop_duplicates()
-            .set_index('Scheme')['AMFI']
-            .to_dict()
-        )
+        navs_dict = {}
+        for amfi in valid_amfis:
+            nav_df = fetch_historical_nav(amfi)
+            if nav_df is not None and not nav_df.empty:
+                navs_dict[amfi] = nav_df
 
         # Build date range from first transaction to today
         first_txn_date = pd.to_datetime(transactions_df['Date'].min()).date()
         date_range = pd.date_range(start=first_txn_date, end=live_date, freq='D')
 
-        # Build NAV grid (forward-filled for weekends/holidays)
-        df_navs = pd.DataFrame(index=date_range)
-        for amfi in valid_amfis:
-            nav_df = fetch_historical_nav(amfi)
-            if nav_df is not None and not nav_df.empty:
-                df_navs[amfi] = nav_df['nav'].reindex(date_range, method='ffill').bfill()
+        daily_port_val, skipped_funds = compute_daily_portfolio_value(
+            transactions_df, navs_dict, date_range, scheme_amfi_map, holdings_df
+        )
 
-        # Daily portfolio value using current holdings × historical NAV
-        daily_port_val = pd.Series(0.0, index=date_range)
-        for _, row in holdings_df.iterrows():
-            amfi = scheme_amfi_map.get(row['Scheme'])
-            units = row['Units']
-            if amfi and amfi in df_navs.columns:
-                daily_port_val += df_navs[amfi] * units
-            else:
-                daily_port_val += row.get('Value', 0.0)
+        # B1. Reconciliation Guard
+        recon_warnings = []
+        final_tx_units = transactions_df.groupby('Scheme')['Units'].sum()
+        if not holdings_df.empty:
+            statement_units = holdings_df.groupby('Scheme')['Units'].sum()
+            for scheme, stmt_u in statement_units.items():
+                cum_units = final_tx_units.get(scheme, 0.0)
+                if stmt_u > 0:
+                    diff = abs(cum_units - stmt_u)
+                    if (diff / stmt_u) > 0.01:
+                        recon_warnings.append(f"{scheme}: Computed units ({cum_units:.3f}) drift from statement units ({stmt_u:.3f})")
 
         base_cf_df = prepare_base_cashflows(transactions_df, include_switches=False)
 
         dates_list = list(date_range)
         vals_list = list(daily_port_val.values)
+
+        # B2. Trend Downsampling
+        from datetime import timedelta
+        cutoff_date = live_date - timedelta(days=180)
+        cas_date_obj = latest_val_date if latest_val_date else live_date
+        cas_window_start = cas_date_obj - timedelta(days=10)
+        cas_window_end = cas_date_obj + timedelta(days=10)
+
+        downsampled_dates = []
+        downsampled_vals = []
+        for d, val in zip(dates_list, vals_list):
+            d_date = d.date()
+            if d_date >= cutoff_date:
+                downsampled_dates.append(d)
+                downsampled_vals.append(val)
+            elif cas_window_start <= d_date <= cas_window_end:
+                downsampled_dates.append(d)
+                downsampled_vals.append(val)
+            elif d.weekday() == 4: # Friday
+                downsampled_dates.append(d)
+                downsampled_vals.append(val)
 
         def _xirr_for_day(args):
             d, val = args
@@ -585,7 +593,7 @@ async def get_trend(
             if x is None or not math.isfinite(x):
                 return None
             xirr_pct = x * 100
-            if not math.isfinite(xirr_pct) or abs(xirr_pct) > 1000:
+            if not math.isfinite(xirr_pct) or abs(xirr_pct) > 300:
                 return None
             return {
                 "date": d_obj.strftime("%Y-%m-%d"),
@@ -594,15 +602,16 @@ async def get_trend(
             }
 
         trend = []
+        import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-            for result in ex.map(_xirr_for_day, zip(dates_list, vals_list)):
+            for result in ex.map(_xirr_for_day, zip(downsampled_dates, downsampled_vals)):
                 if result is not None:
                     trend.append(result)
 
         # Sort by date (parallel results arrive in order, but be safe)
         trend.sort(key=lambda r: r["date"])
 
-        return sanitize_json({"trend": trend, "weightedTrend": []})
+        return sanitize_json({"trend": trend, "trendExcludedFunds": skipped_funds, "reconWarnings": recon_warnings})
 
     except Exception as e:
         logger.error(f"Error computing trend: {traceback.format_exc()}")

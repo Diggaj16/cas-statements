@@ -68,6 +68,22 @@ async def version():
     """Marker for verifying which code revision the running server has loaded."""
     return {"methodology": "standard-xirr-v2"}
 
+@app.post("/api/refresh-cache")
+async def refresh_cache():
+    """Clear cached NAV data (and the AMFI master / search caches) so the next
+    analysis refetches fresh NAVs from mfapi. Preserves the user's saved manual
+    scheme overrides so they don't have to re-map funds after refreshing.
+    """
+    try:
+        manual = nav_cache.get('__manual_scheme_map__')
+        nav_cache.clear()
+        if manual:
+            nav_cache.set('__manual_scheme_map__', manual)  # restore user mappings
+        return {"status": "success", "message": "NAV cache cleared — fresh values will load."}
+    except Exception as e:
+        logger.error(f"Failed to clear cache: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/search-scheme")
 async def search_scheme(q: str):
     """Proxy mfapi's scheme search so the manual-mapping UI can let the user pick
@@ -94,6 +110,30 @@ async def search_scheme(q: str):
     except Exception as e:
         logger.warning(f"Scheme search failed for '{q}': {e}")
         return {"results": []}
+
+def resolve_opening_balance(units, open_date, scheme, nav_df):
+    """
+    Given an opening balance row, resolve its true cost basis and date.
+    If the CAS `from_` date predates the fund's NAV history, snap the date
+    forward to the fund's earliest NAV (inception) to avoid a phantom holding period.
+    Returns: (resolved_date, resolved_nav, resolved_amount, warning_str or None)
+    """
+    dt = pd.to_datetime(open_date)
+    navs_until = nav_df.loc[:dt]['nav']
+    warning = None
+    if navs_until.empty:
+        resolved_date = nav_df.index[0]
+        resolved_nav = float(nav_df['nav'].iloc[0])
+        warning = (
+            f"{scheme}: opening units predate available NAV — dated to the fund's earliest "
+            f"NAV ({resolved_date.date()}) so XIRR isn't stretched over a phantom period. "
+            f"Verify against your broker if exact."
+        )
+    else:
+        resolved_date = dt
+        resolved_nav = float(navs_until.iloc[-1])
+        
+    return resolved_date, resolved_nav, float(units * resolved_nav), warning
 
 def process_cas_and_valuation(cas_tmp_path, cas_password, manual_mapping=None):
     parsed_data = parse_cas(cas_tmp_path, cas_password)
@@ -156,11 +196,12 @@ def process_cas_and_valuation(cas_tmp_path, cas_password, manual_mapping=None):
             nav_df = fetch_historical_nav(amfi) if (amfi and str(amfi).strip()) else None
             if nav_df is not None and not nav_df.empty and pd.notna(open_date):
                 try:
-                    dt = pd.to_datetime(open_date)
-                    navs_until = nav_df.loc[:dt]['nav']
-                    closest_nav = navs_until.iloc[-1] if not navs_until.empty else nav_df['nav'].iloc[0]
-                    transactions_df.at[idx, 'Amount'] = float(units * closest_nav)
-                    transactions_df.at[idx, 'NAV'] = float(closest_nav)
+                    res_date, res_nav, res_amt, warning = resolve_opening_balance(units, open_date, scheme, nav_df)
+                    transactions_df.at[idx, 'Date'] = res_date
+                    transactions_df.at[idx, 'NAV'] = res_nav
+                    transactions_df.at[idx, 'Amount'] = res_amt
+                    if warning:
+                        data_warnings.append(warning)
                 except Exception as e:
                     logger.warning(f"Failed to fix opening balance for {amfi}: {e}")
             else:
@@ -203,11 +244,6 @@ def process_cas_and_valuation(cas_tmp_path, cas_password, manual_mapping=None):
 
     return (transactions_df, holdings_df, total_value, latest_val_date, 
             live_total_value, live_date, data_warnings, unresolved_funds, scheme_amfi_map, valid_amfis)
-
-@app.post("/api/clear-cache")
-async def clear_cache():
-    nav_cache.clear()
-    return {"message": "Cache cleared successfully"}
 
 @app.post("/api/analyze")
 async def analyze_cas(

@@ -7,6 +7,9 @@ from metrics import (calculate_xirr, build_portfolio_history,
                      compute_invested_withdrawn, prepare_base_cashflows,
                      calculate_xirr_fast, compute_daily_portfolio_value)
 
+from main import resolve_opening_balance
+from parser import extract_transactions
+
 class TestMetrics(unittest.TestCase):
     def test_calculate_xirr_basic_positive(self):
         # Invest 10,000 on Jan 1, Valuation is 11,000 on Dec 31
@@ -340,6 +343,63 @@ class TestDailyPortfolioValue(unittest.TestCase):
         # Only A (100 units * 10) contributes; B adds nothing.
         self.assertAlmostEqual(daily.iloc[-1], 1000.0)
 
+
+class TestParserDateFixes(unittest.TestCase):
+    def test_extract_transactions_mixed_date_format(self):
+        # A CAS with statement from_ as '01-Jan-2003' and txn date as '2023-01-15'
+        parsed_data = {
+            'statement_period': {'from_': '01-Jan-2003', 'to': '31-Dec-2023'},
+            'folios': [{
+                'PAN': 'ABCDE1234F',
+                'schemes': [{
+                    'scheme': 'Test Scheme',
+                    'isin': 'INF12345678',
+                    'amfi': '123456',
+                    'open': 100.0,
+                    'transactions': [
+                        {'date': '2023-01-15', 'amount': 1000.0, 'units': 10.0, 'nav': 100.0, 'type': 'PURCHASE', 'description': 'Purchase'}
+                    ]
+                }]
+            }]
+        }
+        df = extract_transactions(parsed_data)
+        self.assertEqual(len(df), 2)
+        
+        opening_row = df[df['Type'] == 'OPENING_BALANCE'].iloc[0]
+        purchase_row = df[df['Type'] == 'PURCHASE'].iloc[0]
+        
+        # Verify it parsed without raising an error and the dates are proper datetimes
+        self.assertEqual(opening_row['Date'], pd.Timestamp('2003-01-01'))
+        self.assertEqual(purchase_row['Date'], pd.Timestamp('2023-01-15'))
+
+
+class TestResolveOpeningBalance(unittest.TestCase):
+    def test_opening_balance_dating_normal(self):
+        # NAV history starts in 2000, CAS statement from 2003. Should resolve to 2003.
+        nav_dates = pd.date_range('2000-01-01', '2010-01-01', freq='D')
+        nav_df = pd.DataFrame({'nav': np.linspace(10, 20, len(nav_dates))}, index=nav_dates)
+        
+        res_date, res_nav, res_amt, warning = resolve_opening_balance(
+            100.0, '2003-01-01', 'Test Scheme', nav_df
+        )
+        self.assertEqual(res_date, pd.Timestamp('2003-01-01'))
+        self.assertIsNone(warning)
+
+    def test_opening_balance_dating_predates_nav(self):
+        # NAV history starts in 2005, CAS statement from 2003. 
+        # Should snap forward to fund inception (2005)
+        nav_dates = pd.date_range('2005-01-01', '2010-01-01', freq='D')
+        nav_df = pd.DataFrame({'nav': [12.5] * len(nav_dates)}, index=nav_dates)
+        
+        res_date, res_nav, res_amt, warning = resolve_opening_balance(
+            100.0, '2003-01-01', 'Test Scheme', nav_df
+        )
+        
+        self.assertEqual(res_date, pd.Timestamp('2005-01-01'))
+        self.assertEqual(res_nav, 12.5)
+        self.assertEqual(res_amt, 1250.0)
+        self.assertIsNotNone(warning)
+        self.assertIn("dated to the fund's earliest NAV", warning)
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,0 +1,37 @@
+@import "tailwindcss";
+
+@theme {
+  --color-vine-indigo: #9B81F5;
+  --color-foundation-grey: #1D1D1B;
+  --color-clarity-white: #FFFFFF;
+  --color-vine-mint: #B1F0DB;
+  --color-vine-peach: #FFBB90;
+  --color-vine-mustard: #F1F68E;
+  --font-heading: 'Poppins', sans-serif;
+  --font-body: 'Poppins', sans-serif;
+}
+
+@layer base {
+  body {
+    background-color: var(--color-foundation-grey);
+    color: var(--color-clarity-white);
+    font-family: var(--font-body);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-heading);
+    font-weight: 600;
+    color: var(--color-clarity-white);
+  }
+}
+
+@utility bevel-emboss {
+  box-shadow: inset 1px 1px 3px rgba(255, 255, 255, 0.4), inset -1px -1px 3px rgba(0, 0, 0, 0.4);
+}
+
+@utility glass-card {
+  background-color: #2A2A28;
+  border-radius: 0.75rem;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+}

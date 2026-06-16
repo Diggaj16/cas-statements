@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+casparser
+pyxirr
+pandas
+plotly
+tenacity
+diskcache
+BharatFinTrack
